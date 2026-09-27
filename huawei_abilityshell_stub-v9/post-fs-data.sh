@@ -1,0 +1,182 @@
+#!/system/bin/sh
+#
+# huawei_abilityshell_stub - post-fs-data
+#
+# 为「鸿蒙壳 APK」（畅连 com.huawei.meetime 等）补上华为设备专有的
+# ohos.abilityshell.HarmonyApplication 及其依赖的 EMUI/HuaweiAPI 真类。
+#
+# ─────────── 机制 ───────────
+# 畅连的 MainApplication 继承 ohos.abilityshell.HarmonyApplication（鸿蒙运行时类），
+# 非华为机上不存在 → 启动即 ClassNotFound。注意崩溃日志会把它报成子类
+# HiCallApplication 找不到，真因是父类解析失败（suppressed 异常在末尾）。
+#
+# 畅连清单声明了 uses-library com.huawei.nb.searchmanager。只要让系统「注册」这个
+# 库名，PackageManager 就会把对应 jar 填进 ApplicationInfo.sharedLibraryFiles，
+# LoadedApk 随之把它加入应用类加载器 —— **无需 Xposed/LSPosed**（已实测验证）。
+#
+# 注册库名要靠一个已存在的 /system_ext/etc/permissions/*.xml（无法新增文件），
+# 所以 bind 顶替一个「没人用」的注册点；具体顶替哪个由 customize.sh 探测并写入
+# files/target.conf。全套只用 bind 挂载，不写入任何分区真实文件 → 卸载即复原。
+#
+# 安全阀：<模块>/disable 或 /data/adb/skip_abilityshell_stub
+#
+# ─────────── jar 构成（v8，多 dex 条目，靠前者胜出）───────────
+#   classes.dex   : android.util.HiLog 同签名 no-op 桩
+#                   （真 HiLog 依赖华为私有 libhilog_jni.so，非华为机无法加载，
+#                     故必须遮蔽；用 no-op 而非抛异常，避免调用方崩）
+#   classes2.dex  : 手写桩 282 个（v9 删掉 3 个空桩，见 README 第十二节）（ohos/abilityshell 骨架 + 缺失的华为类）
+#   classes3.dex  : hwEmui.jar 原版 dex 字节（EMUI 兼容层核心）
+#   classes4.dex  : hwframework.jar 原版 dex 字节（com.huawei.android.* Ex 类）
+#
+#   ⚠ 关键规则：类按 dex 顺序解析，**先定义者胜出**
+#     （classes → classes2 → classes3 → classes4）。
+#     放在前面的手写桩会静默压制后面的固件真类。classes2 的 285 个桩里
+#     有 129 个与固件真类重名。已修的两个实际危害：
+#       · BuildEx：桩的 getUDID() 返回 "" → 拿不到 comToken
+#         （v8 已把真类按华为官方《HMS Core Preloading Guide → Unique Device ID》
+#          补成合格实现：FINGERPRINTEX 退化为 FINGERPRINT，三个 UDID 取值方法
+#          返回确定性常量，并删掉遮蔽它的桩）
+#       · NoExtAPIException：桩 extends Object，真类 extends RuntimeException
+#         → 固件真类 MSimTelephonyManager 被 ART 以
+#           "NoExtAPIException not instanceof Throwable" 整体 VerifyError 拒绝
+#
+#   ⚠ 关键教训：**不要试图删掉与真类重名的手写桩**（v9/v10 已试，应用崩溃）。
+#     真类能 Class.forName 成功，不代表可用 —— 它的方法体会引用本机不存在的
+#     华为私有类型，一执行就 NoClassDefFoundError
+#     （ImmersionStyle→android.hwcontrol.HwWidgetFactory；
+#       HwSmsInterceptionListenerEmui→android.telephony.SmsInterceptionListener）。
+#     详见 README 第四节与 files/build/tools/judge_shadow.py。
+#
+#   ★ v9 修订（2026-09-27）：上面这条教训需要加限定条件 —— 删桩本身不是禁忌，
+#     v9/v10 的失败在于**按静态判据成批删**。v9 用的判据更强，四步：
+#       ① 只看「应用 dex 里真的会 invoke、而运行时父类链解析不到」的方法
+#          （tools/gapanalyze.py：按 stub→classes3→classes4→framework 的
+#            **运行时胜出定义**沿 .super 上溯，缺的才是必然崩点）；
+#       ② 若该名字在固件真类里存在，先跑 tools/linkcheck.py 确认真类**方法体里
+#          引用的类型与被调方法全都能解析**（这是 v9/v10 缺失的那一步）；
+#       ③ ①② 都过才删桩 —— v9 删掉 3 个空壳桩（ServiceManagerEx / DisconnectCauseEx
+#          / PhoneStateListenerEx：都是 0 方法的空壳桩，直接引用检查 0 缺失，而真类完整）；
+#       ④ 真类不可用（引用了本机没有的华为私有类型、或该名字压根没有真类）时，
+#          改为在桩里补最小实现 —— v9 三例：CountryDetectorEx 改挂 Object
+#          （android.location.CountryDetector 在 Android 16 已删除，原桩父类根本
+#           加载不了）、InputMethodManagerEx 补 getInstance() 静态转发、
+#          ConfigurationEx 补 <init>(Configuration)V。
+#     每改一个类都做一次真机冷启动验证（tools/apptest.sh：进程存活 + 新 mtlog 里
+#     comToken success + dropbox 无新崩溃 + dex2oat verify 通过 + 前台 Activity
+#     到达 HiCallBindPhoneNumberActivity），全绿才保留。
+#
+#   ⚠ 关键教训：绝不能用 smali 重汇编真实华为类再合并成一个 dex ——
+#     ART 会拒绝加载（"Direct/virtual method N ... not in expected list"）。
+#     必须保留原版 dex 字节、以 jar 内多 dex 条目组织。
+
+MODDIR=${0%/*}
+LOG=/data/adb/huawei_abilityshell_stub.log
+
+SRC_JAR=$MODDIR/files/huawei_abilityshell_stub.jar
+CONF=$MODDIR/files/target.conf
+GEN_XML=$MODDIR/files/hijack_active.xml
+DEFCTX=u:object_r:system_file:s0
+
+# 未探测时的默认值（AOSP/QTI system_ext 标准文件）
+TGT_XML=${TGT_XML:-/system_ext/etc/permissions/audiosphere.xml}
+TGT_JAR=${TGT_JAR:-/system_ext/framework/audiosphere.jar}
+LIBNAME=${LIBNAME:-com.huawei.nb.searchmanager}
+
+# v9 构建指纹（自检用；不一致只告警不阻断，便于自行重建）
+EXP_MD5=0c292d83f9d2a0411a5a279819d718f2
+EXP_SIZE=2470241
+
+log() { echo "[$(date '+%m-%d %H:%M:%S')] $*" >>"$LOG"; }
+ctx_of() {
+    c=$(ls -Z "$1" 2>/dev/null | awk '{print $1}')
+    case "$c" in
+        u:object_r:system*) echo "$c" ;;
+        *)                  echo "$DEFCTX" ;;
+    esac
+}
+
+log "---- boot ----"
+
+if [ -f "$MODDIR/disable" ] || [ -f /data/adb/skip_abilityshell_stub ]; then
+    log "disabled by flag, skip"
+    exit 0
+fi
+
+# ── 读安装期探测结果 ──
+if [ -f "$CONF" ]; then
+    # 只取赋值行，避免执行配置里的任意内容
+    TGT_XML=$(grep '^TGT_XML=' "$CONF" 2>/dev/null | tail -1 | cut -d= -f2-)
+    TGT_JAR=$(grep '^TGT_JAR=' "$CONF" 2>/dev/null | tail -1 | cut -d= -f2-)
+    LIBNAME=$(grep '^LIBNAME=' "$CONF" 2>/dev/null | tail -1 | cut -d= -f2-)
+    [ -n "$TGT_XML" ] || TGT_XML=/system_ext/etc/permissions/audiosphere.xml
+    [ -n "$TGT_JAR" ] || TGT_JAR=/system_ext/framework/audiosphere.jar
+    [ -n "$LIBNAME" ] || LIBNAME=com.huawei.nb.searchmanager
+    log "conf: xml=$TGT_XML jar=$TGT_JAR lib=$LIBNAME"
+else
+    log "no target.conf, using defaults (audiosphere)"
+fi
+
+# ── 前置校验：任一不过绝不挂载，避免挂坏系统权限表 ──
+[ -f "$SRC_JAR" ] || { log "FATAL jar missing"; exit 1; }
+[ -f "$TGT_XML" ] || { log "FATAL target xml absent: $TGT_XML"; exit 1; }
+[ -f "$TGT_JAR" ] || { log "FATAL target jar absent: $TGT_JAR"; exit 1; }
+
+[ "$(head -c 2 "$SRC_JAR")" = "PK" ] || { log "FATAL jar not a zip"; exit 1; }
+sz=$(stat -c %s "$SRC_JAR" 2>/dev/null)
+{ [ -n "$sz" ] && [ "$sz" -gt 512 ]; } || { log "FATAL jar too small"; exit 1; }
+
+# ── 生成替换用的 permissions XML ──
+#   只声明我们要的库名，file 指向被顶替的那个 jar 路径。
+cat >"$GEN_XML" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<!-- generated by huawei_abilityshell_stub at boot; do not edit -->
+<permissions>
+    <library name="$LIBNAME" file="$TGT_JAR" />
+</permissions>
+EOF
+
+grep -q "<permissions>" "$GEN_XML" || { log "FATAL xml gen failed"; exit 1; }
+grep -q "name=\"$LIBNAME\"" "$GEN_XML" || { log "FATAL xml lacks libname"; exit 1; }
+
+# ── 指纹自检 ──
+if [ "$sz" != "$EXP_SIZE" ]; then
+    log "WARN jar size $sz != expected $EXP_SIZE (v9)"
+fi
+md5=$(md5sum "$SRC_JAR" 2>/dev/null | awk '{print $1}')
+if [ "$md5" = "$EXP_MD5" ]; then
+    log "build fingerprint OK (v9)"
+else
+    log "WARN jar md5=$md5 != v9 $EXP_MD5 (自行重建过？继续挂载)"
+fi
+if grep -qa 'classes4.dex' "$SRC_JAR" 2>/dev/null; then
+    log "multi-dex OK (含真类 hwEmui/hwframework)"
+else
+    log "WARN 未发现 classes4.dex —— 疑似退化为手写桩包，功能将不完整"
+fi
+
+# ── 1) 权限 XML ──
+c=$(ctx_of "$TGT_XML")
+chcon "$c" "$GEN_XML" 2>/dev/null
+umount -l "$TGT_XML" 2>/dev/null
+if mount --bind "$GEN_XML" "$TGT_XML"; then
+    log "mount XML ok ctx=$c"
+else
+    log "ERROR mount XML ($TGT_XML)"
+fi
+
+# ── 2) jar（必须 system_file，应用进程才可读）──
+c=$(ctx_of "$TGT_JAR")
+chcon "$c" "$SRC_JAR" 2>/dev/null
+umount -l "$TGT_JAR" 2>/dev/null
+if mount --bind "$SRC_JAR" "$TGT_JAR"; then
+    log "mount JAR ok ctx=$c"
+else
+    log "ERROR mount JAR ($TGT_JAR)"
+fi
+
+# ── 自检 ──
+grep -q "name=\"$LIBNAME\"" "$TGT_XML" 2>/dev/null \
+    && log "VERIFY xml ok" || log "VERIFY xml NOT effective"
+[ "$(md5sum <"$TGT_JAR" 2>/dev/null)" = "$(md5sum <"$SRC_JAR" 2>/dev/null)" ] \
+    && log "VERIFY jar ok" || log "VERIFY jar mismatch"
+log "done"

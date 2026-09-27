@@ -1,0 +1,6 @@
+id=huawei_abilityshell_stub
+name=鸿蒙壳补丁 (畅连 abilityshell stub)
+version=v9
+versionCode=9
+author=Eta
+description=让华为「畅连」(com.huawei.meetime) 等鸿蒙壳应用在非华为机型上启动。原理：注册其清单声明的 uses-library，使系统把内含 4762 个华为框架类的 jar 载入应用类加载器（含 Mate40 鸿蒙4.3 固件真类 hwEmui/hwframework），并按同签名遮蔽 android.util.HiLog。安装时自动探测本机可安全顶替的共享库注册点，不写死机型；全部 bind 挂载、零写入，卸载即复原。v9 收敛运行时缺方法：按「应用真会 invoke 且运行时父类链解析不到」的判据，删 3 个空壳桩、补 3 个最小实现，逐个真机冷启动验证。dex 039，Android 9+。无需 LSPosed。详见 README.md / INSTALL.md。
